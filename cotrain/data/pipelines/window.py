@@ -29,6 +29,8 @@ from cotrain.data.schemas import (
     array_dtype,
 )
 
+ROBOT_RGB_PADDING_VALUE = np.uint8(0)
+
 
 def _read_meta_str(group: h5py.Group, key: str) -> str:
     raw = group[key][()]
@@ -51,11 +53,15 @@ def read_window(
       rgb, box_state, phase, contact_lift, proprio, human_kin, action,
       source (str), source_is_robot (bool array shape ()).
 
-    For robot episodes, `human_kin` is a zero array of shape (T, D_h);
-    for human episodes, `proprio` and `action` are zero arrays of the
-    appropriate shapes. This is the "pad the other source" behaviour the
-    masking module (§3.4) expects, and lets the sampler stack mixed-source
-    samples into one batch dict.
+    Source-specific files (per the §1.1 contract update):
+      - robot HDF5s contain proprio, action, box_state, phase, contact_lift
+      - human HDF5s contain rgb, human_kin, box_state, phase, contact_lift
+
+    For robot episodes, `rgb` is filled with zeros of shape (T, 224, 224, 3)
+    uint8 and `human_kin` is zero (T, D_h). For human episodes, `proprio`
+    and `action` are zero. This pad-the-other-source behaviour is what
+    lets the sampler stack mixed-source samples into one batch dict; the
+    §3.4 mask zeros the loss contribution for the inactive modalities.
     """
     h5_path = Path(h5_path)
     with h5py.File(h5_path, "r") as f:
@@ -74,7 +80,6 @@ def read_window(
             )
 
         # Bridge slots — present in both sources.
-        rgb = f["rgb"][start:end]
         box_state = f["box_state"][start:end]
         phase = f["phase"][start:end]
         contact_lift = f["contact_lift"][start:end]
@@ -82,12 +87,19 @@ def read_window(
         if source == "robot":
             proprio = f["proprio"][start:end]
             action = f["action"][start:end]
+            rgb = (
+                np.full((T, RGB_H, RGB_W, 3), ROBOT_RGB_PADDING_VALUE,
+                        dtype=array_dtype("rgb"))
+                if pad_other_source
+                else None
+            )
             human_kin = (
                 np.zeros((T, D_h), dtype=array_dtype("human_kin"))
                 if pad_other_source
                 else None
             )
         else:  # human
+            rgb = f["rgb"][start:end]
             human_kin = f["human_kin"][start:end]
             proprio = (
                 np.zeros((T, D_p), dtype=array_dtype("proprio"))
@@ -101,11 +113,12 @@ def read_window(
             )
 
     out: dict[str, np.ndarray] = {
-        "rgb":          rgb,                      # (T, 224, 224, 3) uint8
         "box_state":    box_state,                # (T, 7)
         "phase":        phase,                    # (T, 1) int8
         "contact_lift": contact_lift,             # (T, 3) float32
     }
+    if rgb is not None:
+        out["rgb"] = rgb                          # (T, 224, 224, 3) uint8
     if proprio is not None:
         out["proprio"] = proprio                  # (T, D_p)
     if human_kin is not None:
@@ -118,8 +131,10 @@ def read_window(
 
 
 # Sanity helpers used by tests / the sampler.
+# rgb is included here only because reads with pad_other_source=True always
+# populate it (real for human, zeros for robot). With pad_other_source=False
+# it can be absent from a robot episode.
 EXPECTED_SHAPES = {
-    "rgb":          (RGB_H, RGB_W, 3),
     "box_state":    (7,),
     "phase":        (1,),
     "contact_lift": (3,),
@@ -134,6 +149,8 @@ def assert_window_shapes(window: dict[str, np.ndarray], T: int) -> None:
             raise ValueError(
                 f"{name} shape {arr.shape} != expected {(T,) + suffix}"
             )
+    if "rgb" in window and window["rgb"].shape != (T, RGB_H, RGB_W, 3):
+        raise ValueError(f"rgb shape {window['rgb'].shape}, expected {(T, RGB_H, RGB_W, 3)}")
     if "proprio" in window and window["proprio"].shape[0] != T:
         raise ValueError(f"proprio shape {window['proprio'].shape}, expected leading {T}")
     if "human_kin" in window and window["human_kin"].shape[0] != T:

@@ -45,9 +45,10 @@ def test_batch_size_and_split_match_spec(shard_root: Path) -> None:
     assert batch["box"].shape == (8, T, 7)
     assert batch["phase"].shape == (8, T, 1)
     assert batch["contact"].shape == (8, T, 3)
-    assert batch["state_robot"].shape == (8, T, 50)
-    assert batch["state_human"].shape == (8, T, 157)
-    assert batch["action"].shape == (8, T, 20)
+    from cotrain.data.schemas import DEFAULT_D_A, DEFAULT_D_H, DEFAULT_D_P
+    assert batch["state_robot"].shape == (8, T, DEFAULT_D_P)
+    assert batch["state_human"].shape == (8, T, DEFAULT_D_H)
+    assert batch["action"].shape == (8, T, DEFAULT_D_A)
 
 
 def test_mixing_ratio_holds_over_1000_batches(shard_root: Path) -> None:

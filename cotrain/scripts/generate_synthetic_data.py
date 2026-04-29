@@ -131,7 +131,6 @@ def _write_episode(
     phases = _phase_trajectory(T, rng)
     box_state = _box_trajectory(T, phases, rng)
     contact_lift = _contact_from_phase(phases)
-    rgb = _rgb(T, phases, rng)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with h5py.File(out_path, "w") as f:
@@ -139,13 +138,18 @@ def _write_episode(
         f.create_dataset("box_state",    data=box_state,    compression="gzip", compression_opts=4)
         f.create_dataset("phase",        data=phases,       compression="gzip", compression_opts=4)
         f.create_dataset("contact_lift", data=contact_lift, compression="gzip", compression_opts=4)
-        f.create_dataset("rgb",          data=rgb,          compression="gzip", compression_opts=4)
+        # Source-specific. Note: robot has no rgb (state-only Stage 0
+        # rollouts; §3.4 masks VIS for robot samples anyway). Defer the
+        # rgb generation to the human branch so we don't allocate a (T,
+        # 224, 224, 3) tensor for every robot episode.
         if source == "robot":
             f.create_dataset("proprio", data=_proprio(T, DEFAULT_D_P, rng),
                              compression="gzip", compression_opts=4)
             f.create_dataset("action",  data=_action(T, DEFAULT_D_A, rng),
                              compression="gzip", compression_opts=4)
         else:
+            f.create_dataset("rgb",       data=_rgb(T, phases, rng),
+                             compression="gzip", compression_opts=4)
             f.create_dataset("human_kin", data=_human_kin(T, DEFAULT_D_H, rng),
                              compression="gzip", compression_opts=4)
 

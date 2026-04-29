@@ -21,13 +21,16 @@ RGB_W = 224
 
 SAMPLE_RATE_HZ = 30  # all groups resampled here upstream of this code
 
-# Default modality dimensions. These are *defaults for the synthetic
-# generator*; the actual values per embodiment must be recorded in the
-# manifest (`box_size_class` is a coarse class label; the dimensions
-# themselves are inferred from each HDF5 at load time).
-DEFAULT_D_P = 50    # q(20) + qdot(20) + root_quat(4) + root_lin_vel(3) + root_ang_vel(3)
-DEFAULT_D_H = 157   # head pose(7) + 2 wrists * 7 + 2 hands * 21 * 3 + upper-body joints(10) - tweak
-DEFAULT_D_A = 20    # robot joint position targets
+# Default modality dimensions. These are the **G1 29-DoF defaults**
+# matching the holosoma robot rollout pipeline:
+#   D_p = q(29) + qdot(29) + root_quat(4) + root_lin_vel(3) + root_ang_vel(3) = 68
+#   D_a = 29 joint position targets
+# Human kinematics dim is still a placeholder until Stage 1 (Aria) lands.
+# The actual values per embodiment are recorded in the manifest at
+# preprocess time; this constant is just the synthetic-data fallback.
+DEFAULT_D_P = 68    # G1 29-DoF: dof_pos(29) + dof_vel(29) + root_quat(4) + lin_vel(3) + ang_vel(3)
+DEFAULT_D_H = 157   # head pose(7) + 2 wrists * 7 + 2 hands * 21 * 3 + upper-body joints(10)
+DEFAULT_D_A = 29    # G1 29-DoF joint position targets
 
 Source = Literal["robot", "human"]
 
@@ -63,8 +66,14 @@ class EpisodeMeta(BaseModel):
 # Validator (§1.3) asserts these exactly. `proprio`/`action` accept variable
 # trailing dim because per-embodiment D_p / D_a may differ — the validator
 # only requires consistency *within one episode*.
+#
+# **Note:** `rgb` is human-only (PROJECT_PLAN_1.md §1.1). Robot rollouts
+# come from holosoma's state-only WBT pipeline with no egocentric camera;
+# the §3.4 mask replaces VIS for every robot sample. The collator
+# zero-pads the rgb axis for robot rows so the encoder sees a uniform
+# shape across a mixed batch.
 ARRAY_SPEC: dict[str, tuple[tuple[int, ...] | tuple[None, ...], np.dtype, set[Source]]] = {
-    "rgb":          ((RGB_H, RGB_W, 3), np.dtype(np.uint8),   {"robot", "human"}),
+    "rgb":          ((RGB_H, RGB_W, 3), np.dtype(np.uint8),   {"human"}),
     "proprio":      ((None,),           np.dtype(np.float32), {"robot"}),
     "human_kin":    ((None,),           np.dtype(np.float32), {"human"}),
     "box_state":    ((7,),              np.dtype(np.float32), {"robot", "human"}),

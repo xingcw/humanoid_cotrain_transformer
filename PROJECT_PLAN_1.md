@@ -84,18 +84,20 @@ Each `ep_XXXXXX.h5` has the following groups, **all aligned on a common timeline
 
 | Group key            | Shape per timestep        | Robot? | Human? | Notes |
 |----------------------|---------------------------|--------|--------|-------|
-| `rgb`                | `(H, W, 3)` uint8         | ✓      | ✓      | 224×224 after preprocess. Robot RGB used for action grounding only — masked at training time (see §3.4). |
-| `proprio`            | `(D_p,)` float32          | ✓      | —      | Concat of `q, qdot, root_quat, root_lin_vel, root_ang_vel`. Fixed `D_p` per embodiment; record in manifest. |
+| `rgb`                | `(H, W, 3)` uint8         | —      | ✓      | 224×224 after preprocess. **Human-only.** Robot rollouts come from holosoma's state-only WBT pipeline and have no egocentric camera; the §3.4 mask already replaces VIS with `[VIS_MASK]` for every robot sample, so there is nothing for a robot RGB to ground. The trainer zero-pads the RGB axis for robot rows so the encoder sees a uniformly-shaped batch. |
+| `proprio`            | `(D_p,)` float32          | ✓      | —      | Concat of `q, qdot, root_quat, root_lin_vel, root_ang_vel`. Fixed `D_p` per embodiment; record in manifest. **G1 29-DoF: D_p = 29 + 29 + 4 + 3 + 3 = 68.** |
 | `human_kin`          | `(D_h,)` float32          | —      | ✓      | Concat of head pose (SLAM), wrist 6-DoF poses, hand keypoints (21 per hand × 3), upper-body joint angles. Fixed `D_h`. |
-| `box_state`          | `(7,)` float32            | ✓      | ✓      | `[x, y, z, qw, qx, qy, qz]` of box relative to **camera frame**. **The shared bridge.** Same definition for both datasets — this is non-negotiable. |
-| `action`             | `(D_a,)` float32          | ✓      | —      | Robot joint position targets. |
-| `phase`              | `(1,)` int8               | ✓      | ✓      | Enum: 0=approach, 1=reach, 2=contact, 3=lift, 4=hold. **Shared bridge.** |
-| `contact_lift`       | `(3,)` float32            | ✓      | ✓      | `[left_contact, right_contact, lifted]` ∈ {0,1}. **Shared bridge.** |
+| `box_state`          | `(7,)` float32            | ✓      | ✓      | `[x, y, z, qw, qx, qy, qz]` of box relative to **camera frame**. **The shared bridge.** Same definition for both datasets — this is non-negotiable. For robot rollouts the camera is a virtual head-mounted frame derived from G1 body states (no actual sensor needed). |
+| `action`             | `(D_a,)` float32          | ✓      | —      | Robot joint position targets. **G1 29-DoF: D_a = 29.** |
+| `phase`              | `(1,)` int8               | ✓      | ✓      | Enum: 0=approach, 1=reach, 2=contact, 3=lift, 4=hold. **Shared bridge.** Derived rule-based from box height + hand–box distance + hand contact (see `cotrain/scripts/derive_bridge_signals.py`). |
+| `contact_lift`       | `(3,)` float32            | ✓      | ✓      | `[left_contact, right_contact, lifted]` ∈ {0,1}. **Shared bridge.** Derived from contact-force magnitudes (robot) or hand keypoints in proximity (human) plus box-height threshold for `lifted`. |
 | `meta/success`       | scalar bool               | ✓      | ✓      | Per episode, not per timestep. |
 | `meta/episode_id`    | scalar str                | ✓      | ✓      | |
 | `meta/source`        | scalar str                | ✓      | ✓      | `"robot"` or `"human"`. |
 
 **Critical:** `box_state`, `phase`, and `contact_lift` are computed identically in both pipelines. The whole project depends on this — if a robot-side `box_state` uses the world frame and the human-side uses the camera frame, the bridge collapses and co-training fails per Lei et al.'s "disjoint" regime.
+
+**Why robot has no `rgb`:** holosoma's WBT (Stage 0) is a state-only RL stack — observations are joint angles + velocities + motion command. There is no egocentric camera in the actor's input. The visual modality is fundamentally **human-only**, and the §3.4 mask makes that explicit by replacing the projected VIS token with the learned `[VIS_MASK]` for every robot sample. This keeps the bridge slots (`box_state`, `phase`, `contact_lift`) as the only cross-source supervision channel — the design intent of §3.1.
 
 ### 1.2 Manifest
 

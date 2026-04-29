@@ -37,12 +37,16 @@ def test_round_trip_robot(synth_root: Path) -> None:
     start, T = 5, 16
     win = read_window(ep, start, T)
     with h5py.File(ep, "r") as f:
-        for name in ("rgb", "box_state", "phase", "contact_lift", "proprio", "action"):
+        for name in ("box_state", "phase", "contact_lift", "proprio", "action"):
             np.testing.assert_array_equal(
                 win[name], f[name][start:start + T],
                 err_msg=f"{name} drifted from HDF5",
             )
-    # Padded human-only slot should be zeros with the right shape.
+        # Robot HDF5s no longer contain rgb (§1.1 contract update).
+        assert "rgb" not in f
+    # Padded human-only slots: rgb zeros + human_kin zeros, with the right shape.
+    assert win["rgb"].shape == (T, 224, 224, 3) and win["rgb"].dtype == np.uint8
+    assert (win["rgb"] == 0).all()
     assert win["human_kin"].shape == (T, DEFAULT_D_H)
     assert (win["human_kin"] == 0).all()
     assert win["source_is_robot"].item() is True
@@ -83,3 +87,13 @@ def test_pad_other_source_disabled(synth_root: Path) -> None:
     assert "proprio" not in win
     assert "action" not in win
     assert "human_kin" in win
+
+
+def test_pad_other_source_disabled_for_robot(synth_root: Path) -> None:
+    """Without padding, a robot window does not contain rgb / human_kin."""
+    ep = _first_episode(synth_root, "robot")
+    win = read_window(ep, 0, 16, pad_other_source=False)
+    assert "rgb" not in win
+    assert "human_kin" not in win
+    assert "proprio" in win
+    assert "action" in win
