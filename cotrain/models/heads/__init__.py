@@ -1,3 +1,4 @@
+from cotrain.models.heads.output import OutputHeads
 from cotrain.models.heads.projection import (
     BOX_DIM,
     CONTACT_DIM,
@@ -11,5 +12,6 @@ __all__ = [
     "CONTACT_DIM",
     "DINO_FEATURE_DIM",
     "NUM_PHASES",
+    "OutputHeads",
     "ProjectionHeads",
 ]
