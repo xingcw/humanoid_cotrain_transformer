@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cotrain"
+version = "0.1.0"
+description = "Shared-bridge multimodal transformer for human-humanoid co-training (JAX/TPU)."
+requires-python = ">=3.10,<3.13"
+readme = { text = "See PROJECT_PLAN_1.md", content-type = "text/plain" }
+license = { file = "LICENSE" }
+authors = [{ name = "xingcw" }]
+
+# JAX / libtpu must stay pinned together. When bumping any of jax/jaxlib/libtpu,
+# bump all three in lockstep -- mismatch is the #1 source of "compiles, doesn't run"
+# failures (PROJECT_PLAN_1.md §0).
+dependencies = [
+    "jax==0.6.2",
+    "jaxlib==0.6.2",
+    "libtpu==0.0.17",
+    "flax>=0.10",
+    "optax>=0.2.4",
+    "orbax-checkpoint>=0.11",
+    "grain",
+    "transformers>=4.46",
+    "h5py>=3.10",
+    "pyarrow>=15",
+    "pydantic>=2",
+    "pyyaml>=6",
+    "tqdm>=4.66",
+    "umap-learn>=0.5",
+    "scikit-learn>=1.4",
+    "POT>=0.9",
+    "pillow>=10",
+    "wandb>=0.18",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-xdist",
+    "ruff>=0.6",
+]
+
+[tool.setuptools.packages.find]
+include = ["cotrain*"]
+exclude = ["tests*", "datasets*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

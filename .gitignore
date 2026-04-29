@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual envs
+.venv/
+venv/
+env/
+.python-version
+
+# JAX / TPU
+.jax_compilation_cache/
+*.libtpu_lock
+/tmp/libtpu_lockfile
+
+# Data (always rebuilt from upstream stages or the synthetic generator)
+datasets/
+*.h5
+*.hdf5
+*.array_record
+*.parquet
+
+# Training artifacts
+checkpoints/
+runs/
+wandb/
+eval/plots/
+*.ckpt
+*.orbax
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+*.swp
+
+# Claude Code local settings (per-machine, not for the repo)
+.claude/settings.local.json
