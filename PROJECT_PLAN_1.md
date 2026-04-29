@@ -17,7 +17,7 @@ cotrain/
     pipelines/              # raw → tokenized → grain shards
     schemas/                # Pydantic models for each modality
   models/
-    encoders/               # DINO loader (FlaxDinov2 or precomputed)
+    encoders/               # jimmy DINOv2 loader (frozen, in-graph)
     transformer/            # the shared backbone (Flax NNX)
     heads/                  # one prediction head per modality
   training/
@@ -29,7 +29,7 @@ cotrain/
   eval/
     rollout.py              # closed-loop sim eval
     alignment_probe.py      # UMAP + Wasserstein, per Lei et al.
-    parity_dino.py          # PyTorch vs FlaxDinov2 numerical check (§2.2.1)
+    parity_dino.py          # PyTorch DINOv2 vs jimmy NNX parity check (§2.2.1)
   scripts/
     preprocess_robot.py
     preprocess_human.py
@@ -160,21 +160,36 @@ Each slot has its own input projection into the transformer's `d_model` (default
 
 **Mask tokens:** `[VIS_MASK]` and `[MASK_ACTION]` are two **separate learned vectors**, declared as `nnx.Param(jnp.zeros((d_model,)))` so they appear in the state tree and get optimizer updates. They are not the same as the slot embedding — they replace the projected modality content entirely.
 
-#### 2.2.1 The DINO question
+#### 2.2.1 Visual encoder: `jimmy` DINOv2 in Flax NNX
 
-DINOv2 doesn't have a clean canonical JAX implementation. Three options, in order of preference:
+The visual encoder is **DINOv2 ViT-B/14, loaded via the `jimmy` library** (`clementpoiret/jimmy`). It runs frozen, in-graph, on TPU — no precompute step, no host-side PyTorch dependency at train time.
 
-**Option A (recommended for v1): precompute DINO features offline.** Run PyTorch DINOv2 on a CPU/GPU box once over the full dataset, write features to disk as a new HDF5 group `dino_features` (shape `(T, 768)` per episode, after mean-pool over patch tokens), and have the JAX trainer skip the visual encoder entirely — slot 0 reads directly from `dino_features`. Faster at train time (no encoder forward), removes the parity risk in Option B, ~3GB extra disk per 1000 episodes. **Strong default for v1.**
-
-**Option B: HuggingFace `FlaxDinov2Model`.**
 ```python
-from transformers import FlaxDinov2Model, AutoImageProcessor
-processor = AutoImageProcessor.from_pretrained("facebook/dinov2-base")
-vis_encoder = FlaxDinov2Model.from_pretrained("facebook/dinov2-base")
-```
-**Caveat the agent must verify before depending on this:** there is an open issue (transformers#37246, April 2025) reporting numerical mismatch between `FlaxDinov2Model` and the PyTorch reference on the same input. Before training, run the parity check in `eval/parity_dino.py`: feed 32 identical images through both implementations, compute max-abs-error on the last hidden states. If it's > 1e-3, fall back to Option A. The encoder is frozen, so no gradient — call its `apply` method functionally inside the training step.
+from jimmy.models import DINOV2_VITB14, load_model   # see note below if jimmy ships only ViT-S
+from flax import nnx
 
-**Option C: train a small ViT from scratch on JAX.** Don't. Not for v1. The whole point of using DINO is that we get a strong frozen prior for free.
+rngs = nnx.Rngs(42)
+vis_encoder = load_model(
+    DINOV2_VITB14, rngs=rngs, pretrained=True,
+    url="https://huggingface.co/poiretclement/dinov2_jax/resolve/main/dinov2_vitb14.jim",
+)
+# Forward pass during training:
+#   features = vis_encoder(rgb_518)        # (B, 1370, 768) at 518×518
+#   pooled   = features.mean(axis=1)       # (B, 768) -- mean-pool patch tokens
+# Then pooled feeds the VIS projection head from §2.2.
+```
+
+**ViT size note:** the `jimmy` README explicitly demonstrates `DINOV2_VITS14` (ViT-S/14, 384-dim). ViT-B/14 (768-dim, what the rest of this plan assumes) is the standard size and the hosted-weights URL pattern follows from the S example, but the agent should verify the exact constant name and weight URL by inspecting `jimmy/models/__init__.py` before training. If only ViT-S/14 is available, drop `768 → 384` in the VIS projection head input dim (§2.2) and proceed; the rest of the plan is unaffected.
+
+**Frozen forward, in `nnx.jit`:** call the encoder functionally inside the training step with `nnx.split` to separate the frozen `vis_encoder` state from the rest of the model — this prevents its parameters from showing up in the optimizer's gradient tree. Mean-pool the patch tokens (drop the `[CLS]` token) before the VIS projection head. The output of the projection head goes into slot 0 of the token sequence, exactly as §2.2 specifies.
+
+**Mandatory parity check before any real training run.** `eval/parity_dino.py` runs 32 identical images through both the official PyTorch DINOv2 ViT-B/14 (loaded via `torch.hub.load("facebookresearch/dinov2", "dinov2_vitb14")`) and the `jimmy` JAX model, computes max-abs-error on the patch-token outputs, and asserts it's below 1e-3. This must pass before step 13 of §8 (the scaled training run). If parity fails, the fallback is to precompute features offline with PyTorch DINOv2 and load them at train time as a new HDF5 group `dino_features` — that path is straightforward enough to implement in a day if needed, but the agent should not pre-build it.
+
+**Considered and rejected (for the record, so the agent doesn't relitigate the choice):**
+- HuggingFace `FlaxDinov2Model` — `transformers` v5 (December 2025) sunset Flax support; the class was already pinned to `jax<=0.4.13` (#37262, closed as not planned) and has a known parity bug (#37246).
+- `kylestach/dinov2-jax` — Flax **Linen**, not NNX; would require `nnx.bridge.ToNNX` wrapping at every step. One commit, self-disclaimed correctness, ViT-S only.
+- DINOv3 (Meta, August 2025) — PyTorch-only release; would force the precompute path. Worth revisiting in v2 if the dense-feature improvements matter for this task.
+- Train a ViT from scratch — defeats the point of using a frozen prior.
 
 ### 2.3 Output (prediction) heads
 
@@ -270,7 +285,7 @@ class CoTrainTransformer(nnx.Module):
 2. **The `_apply_modality_masks` function is JIT-compatible.** It takes `source_mask: (B,)` and uses `jnp.where(source_mask[:, None, None], vis_mask_token, vis_real_tokens)` to swap in the learned mask token. Do **not** use Python-level `if source == "robot"` — that doesn't trace.
 3. **Slot identity is preserved by position alone** (see §3.3) — no operation may scramble the slot order.
 
-Total params at the defaults: ~110M backbone + ~5M heads + (86M frozen DINO if Option B from §2.2.1, otherwise zero). Fits comfortably on a single TPU v5p chip; FSDP across multiple chips is for throughput, not capacity.
+Total params at the defaults: ~110M backbone + ~5M heads + 86M frozen DINOv2 ViT-B/14 (not in the optimizer's gradient tree, but resident on device). Fits comfortably on a single TPU v5p chip; FSDP across multiple chips is for throughput, not capacity.
 
 ### 3.3 Slot identity is preserved across the whole stack
 
@@ -398,8 +413,7 @@ def make_loader(w: float, batch_size: int, seed: int):
 | Decoded batch (NumPy)             | ✓    |        |
 | Sharded batch (after `device_put`)|      | ✓      |
 | Model params, optimizer state     |      | ✓      |
-| Frozen DINO encoder (Option B)    |      | ✓      |
-| Pre-extracted DINO features (A)   | ✓ → device per batch |  |
+| Frozen `jimmy` DINOv2 encoder     |      | ✓      |
 
 ---
 
@@ -534,7 +548,7 @@ Build in this order. Each step has a passing test before moving on.
 0. **TPU environment smoke test.** Set up the TPU VM, pin `jax`/`jaxlib`/`libtpu` versions together, run `jax.devices()` and confirm the topology. Then run a 10-line "linear regression on TPU" smoke test before importing any project code. This rules out ~80% of environment issues upfront.
 1. **§1 schemas + validator** — Pydantic models, `validate_dataset.py`, run on a sample of 10 episodes from each side. *Test:* validator catches an intentionally-broken episode.
 2. **§2.2 projection heads** as standalone NNX modules. *Test:* shape & dtype on dummy inputs; `nnx.split(model)` produces a non-empty state tree.
-3. **§2.2.1 DINO setup.** Either Option A (precompute features, write to HDF5) or Option B (`FlaxDinov2Model` + run `eval/parity_dino.py`). Decide before continuing.
+3. **§2.2.1 visual encoder.** Install `jimmy`, load DINOv2 ViT-B/14, write `eval/parity_dino.py`, and run it. Must pass before step 13. *Test:* max-abs-error on patch tokens vs PyTorch reference < 1e-3 over 32 images.
 4. **§2 tokenizer** that reads HDF5 → produces a `(B, 6T, d_model)` array. *Test:* round-trip a known episode and check no dimension shuffling.
 4a. **`build_grain_shards.py`** converts HDF5 → ArrayRecord. *Test:* one shard, one episode, equal contents to source HDF5.
 5. **§3.2 transformer backbone** with random heads. *Tests:* (a) forward pass on CPU first (`JAX_PLATFORMS=cpu`), (b) then on a 1-chip TPU, (c) then on the full mesh. Each step catches a different class of bug.
@@ -575,6 +589,8 @@ These are all real follow-ups, but each one introduces failure modes. Get the si
 | NNX over Linen for new projects (§0, §3.2)                                  | Flax docs (`flax.readthedocs.io`); Google Cloud "JAX for PyTorch developers" (2025) |
 | FSDP via `nnx.with_partitioning` (§3.2, §5.1)                               | "Train a GPT2 model with JAX on TPU" (Google Developers Blog, 2025) |
 | `shard_map` is reserved for tensor-parallel; FSDP sufficient at 110M (§5.1) | JAX scaling book ("How to Parallelize a Transformer for Training") |
-| DINO parity caveat (§2.2.1, Option B)                                       | HF transformers issue #37246 (April 2025) — must verify before use |
+| HuggingFace `transformers` v5 dropped Flax (§2.2.1)                          | "Transformers v5: Simple model definitions" (HF blog, December 2025); transformers#37262 (closed as not planned) |
+| `jimmy` library for native NNX DINOv2 (§2.2.1)                              | `clementpoiret/jimmy` GitHub repo                                    |
+| Don't use `FlaxDinov2Model` (§2.2.1)                                         | HF transformers#37246 (parity bug); pinned to `jax<=0.4.13`         |
 | Orbax v1 for checkpointing (§5.4)                                           | Orbax docs; Flax NNX checkpointing guide                            |
 | `grain` for input pipelines, deterministic by default (§4.2)                | JAX training cookbook                                                |
