@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "cotrain"
 version = "0.1.0"
 description = "Shared-bridge multimodal transformer for human-humanoid co-training (JAX/TPU)."
-requires-python = ">=3.10,<3.13"
+requires-python = ">=3.11,<3.13"
 readme = { text = "See PROJECT_PLAN_1.md", content-type = "text/plain" }
 license = { file = "LICENSE" }
 authors = [{ name = "xingcw" }]
@@ -33,6 +33,9 @@ dependencies = [
     "POT>=0.9",
     "pillow>=10",
     "wandb>=0.18",
+    # Native Flax NNX DINOv2 (PROJECT_PLAN_1.md §2.2.1). Not on PyPI; pinned
+    # to main since v0.0.7 still poetry-pins jax to ^0.4.25. Min Python 3.11.
+    "jimmy-vision @ git+https://github.com/clementpoiret/jimmy.git@main",
 ]
 
 [project.optional-dependencies]
