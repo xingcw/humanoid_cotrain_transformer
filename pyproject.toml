@@ -33,6 +33,7 @@ dependencies = [
     "POT>=0.9",
     "pillow>=10",
     "wandb>=0.18",
+    "matplotlib>=3.8",
     # Native Flax NNX DINOv2 (PROJECT_PLAN_1.md §2.2.1). Not on PyPI; pinned
     # to main since v0.0.7 still poetry-pins jax to ^0.4.25. Min Python 3.11.
     "jimmy-vision @ git+https://github.com/clementpoiret/jimmy.git@main",

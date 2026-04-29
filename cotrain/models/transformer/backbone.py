@@ -106,6 +106,26 @@ class CoTrainTransformer(nnx.Module):
         .apply_modality_masks` — no second copy of the swap logic. The
         loss masks are returned in `_loss_masks` so the loss module can
         respect the bridge / single-source-action design (§3.4)."""
+        seq, loss_masks = self.encode(batch, deterministic=deterministic)
+        per_slot = _split_per_slot(seq, num_slots=NUM_SLOTS)
+        preds = self.out_heads(per_slot)
+        preds["_loss_masks"] = loss_masks
+        return preds
+
+    def encode(
+        self,
+        batch: dict[str, jnp.ndarray],
+        *,
+        deterministic: bool,
+    ) -> tuple[jnp.ndarray, dict[str, jnp.ndarray]]:
+        """Run the forward up to (and including) the final LayerNorm,
+        returning (B, 6T, d_model) hidden states and the (B, T) loss masks.
+
+        Used by the §6.3 alignment probe, which slices the bridge-slot
+        positions out of the returned sequence and computes its
+        Wasserstein / discriminator metrics on those features. The output
+        heads are skipped intentionally — they're not the representation
+        we want to probe."""
         projected = self.heads(**batch)               # dict slot -> (B, T, D)
         projected, loss_masks = apply_modality_masks(
             projected,
@@ -116,11 +136,4 @@ class CoTrainTransformer(nnx.Module):
         seq = self.embeds(projected)                  # (B, 6T, D)
         for block in self.blocks:
             seq = block(seq, deterministic=deterministic)
-        seq = self.norm(seq)
-        per_slot = _split_per_slot(seq, num_slots=NUM_SLOTS)
-        preds = self.out_heads(per_slot)
-        # Stash loss masks under a reserved key so the trainer doesn't have
-        # to recompute them. Reserved-key prefix `_` keeps it from being
-        # confused with predicted slots (state_robot/state_human/etc).
-        preds["_loss_masks"] = loss_masks
-        return preds
+        return self.norm(seq), loss_masks
