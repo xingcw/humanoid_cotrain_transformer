@@ -30,6 +30,7 @@ from cotrain.models.transformer.sequence import (
     SLOT_ORDER,
     SlotTimeEmbeds,
 )
+from cotrain.training.masking import apply_modality_masks
 
 
 @dataclass(frozen=True)
@@ -98,41 +99,28 @@ class CoTrainTransformer(nnx.Module):
         )
 
     def __call__(self, batch: dict[str, jnp.ndarray], *, deterministic: bool):
-        # Project per-slot inputs and assemble the (B, 6T, d_model) sequence
-        # with slot/time embeddings. Modality masking will hook in here in
-        # §8.6 by replacing slot-0 (vis, for robot samples) and slot-5
-        # (action, for human samples) with the learned mask Params before
-        # the transformer blocks fire.
+        """Forward pass. Returns predicted next-step values per slot AND
+        the per-slot loss masks the trainer will multiply into the loss.
+
+        Single source of truth for masking is `cotrain.training.masking
+        .apply_modality_masks` — no second copy of the swap logic. The
+        loss masks are returned in `_loss_masks` so the loss module can
+        respect the bridge / single-source-action design (§3.4)."""
         projected = self.heads(**batch)               # dict slot -> (B, T, D)
-        projected = self._apply_modality_masks(projected, batch["source_mask"])
+        projected, loss_masks = apply_modality_masks(
+            projected,
+            source_mask=batch["source_mask"],
+            vis_mask_token=self.heads.vis_mask.value,
+            action_mask_token=self.heads.action_mask.value,
+        )
         seq = self.embeds(projected)                  # (B, 6T, D)
         for block in self.blocks:
             seq = block(seq, deterministic=deterministic)
         seq = self.norm(seq)
         per_slot = _split_per_slot(seq, num_slots=NUM_SLOTS)
-        return self.out_heads(per_slot)
-
-    def _apply_modality_masks(
-        self,
-        projected: dict[str, jnp.ndarray],
-        source_mask: jnp.ndarray,
-    ) -> dict[str, jnp.ndarray]:
-        """§3.4 mask swap-in. Robot samples drop VIS for `vis_mask`; human
-        samples drop ACTION for `action_mask`. Loss masking is computed in
-        cotrain.training.masking and applied at loss time -- this function
-        only handles the *input-side* token swap.
-
-        Implemented inline as a thin shim until the standalone masking
-        module lands in §8.6; both call sites must stay in sync because
-        any drift here silently breaks training (§3.4 warning)."""
-        is_robot = source_mask[:, None, None]                       # (B, 1, 1)
-        vis_mask_token = jnp.broadcast_to(
-            self.heads.vis_mask.value, projected["vis"].shape,
-        )
-        action_mask_token = jnp.broadcast_to(
-            self.heads.action_mask.value, projected["action"].shape,
-        )
-        out = dict(projected)
-        out["vis"]    = jnp.where(is_robot, vis_mask_token, projected["vis"])
-        out["action"] = jnp.where(is_robot, projected["action"], action_mask_token)
-        return out
+        preds = self.out_heads(per_slot)
+        # Stash loss masks under a reserved key so the trainer doesn't have
+        # to recompute them. Reserved-key prefix `_` keeps it from being
+        # confused with predicted slots (state_robot/state_human/etc).
+        preds["_loss_masks"] = loss_masks
+        return preds

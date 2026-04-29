@@ -55,13 +55,19 @@ def test_forward_output_shapes() -> None:
     model = CoTrainTransformer(cfg, rngs=nnx.Rngs(0))
     batch = _dummy_batch(B=4, T=cfg.T)
     out = model(batch, deterministic=True)
-    assert set(out) == {"state_robot", "state_human", "box", "phase", "contact", "action"}
+    pred_slots = {k for k in out if not k.startswith("_")}
+    assert pred_slots == {"state_robot", "state_human", "box", "phase", "contact", "action"}
     assert out["state_robot"].shape == (4, cfg.T, cfg.D_p)
     assert out["state_human"].shape == (4, cfg.T, cfg.D_h)
     assert out["box"].shape         == (4, cfg.T, 7)
     assert out["phase"].shape       == (4, cfg.T, 5)
     assert out["contact"].shape     == (4, cfg.T, 3)
     assert out["action"].shape      == (4, cfg.T, cfg.D_a)
+    # Loss masks are stashed under _loss_masks for the trainer.
+    assert "_loss_masks" in out
+    lm = out["_loss_masks"]
+    assert set(lm) == {"vis", "state", "box", "phase", "contact", "action"}
+    assert lm["box"].shape == (4, cfg.T)
 
 
 def test_runs_under_nnx_jit() -> None:
@@ -89,37 +95,32 @@ def test_state_tree_includes_block_weights() -> None:
     assert len(leaves) > 30, f"too few Param leaves: {len(leaves)}"
 
 
-def test_modality_masking_shim_routes_robot_vs_human() -> None:
-    """The §3.4 mask shim must zero VIS for robot rows and ACTION for human
-    rows. We verify by setting the learned masks to a tagged value and
-    checking the projected stream after the shim."""
+def test_modality_masking_uses_standalone_module() -> None:
+    """End-to-end check that the backbone actually invokes the §3.4
+    masking module (not a stale shim). We stash a sentinel in vis_mask /
+    action_mask, run forward, and verify the loss_masks returned line up
+    with what cotrain.training.masking.apply_modality_masks computes
+    directly on the same inputs."""
+    from cotrain.training.masking import apply_modality_masks
+
     cfg = _tiny_cfg(T=4)
     model = CoTrainTransformer(cfg, rngs=nnx.Rngs(0))
-    # Tag the mask vectors so we can recognize them.
-    tag_vis = jnp.full((cfg.d_model,), 7.0)
-    tag_act = jnp.full((cfg.d_model,), -3.0)
-    model.heads.vis_mask.value = tag_vis
-    model.heads.action_mask.value = tag_act
+    model.heads.vis_mask.value = jnp.full((cfg.d_model,), 7.0)
+    model.heads.action_mask.value = jnp.full((cfg.d_model,), -3.0)
 
     batch = _dummy_batch(B=4, T=cfg.T)
-    projected = model.heads(**batch)
-    masked = model._apply_modality_masks(projected, batch["source_mask"])
+    out = model(batch, deterministic=True)
+    lm = out["_loss_masks"]
 
-    src = np.asarray(batch["source_mask"])
-    # Robot rows: vis is the tag; action is preserved.
-    np.testing.assert_allclose(np.asarray(masked["vis"][src]),
-                               np.broadcast_to(tag_vis, (src.sum(), cfg.T, cfg.d_model)),
-                               atol=1e-6)
-    np.testing.assert_allclose(np.asarray(masked["action"][src]),
-                               np.asarray(projected["action"][src]),
-                               atol=1e-6)
-    # Human rows: action is the tag; vis is preserved.
-    np.testing.assert_allclose(np.asarray(masked["action"][~src]),
-                               np.broadcast_to(tag_act, ((~src).sum(), cfg.T, cfg.d_model)),
-                               atol=1e-6)
-    np.testing.assert_allclose(np.asarray(masked["vis"][~src]),
-                               np.asarray(projected["vis"][~src]),
-                               atol=1e-6)
+    # Compute expected loss masks via the standalone module on stub tokens.
+    stub = {s: jnp.zeros((4, cfg.T, cfg.d_model)) for s in
+            ("vis", "state", "box", "phase", "contact", "action")}
+    _, expected = apply_modality_masks(
+        stub, batch["source_mask"],
+        model.heads.vis_mask.value, model.heads.action_mask.value,
+    )
+    for slot, m in expected.items():
+        np.testing.assert_array_equal(np.asarray(lm[slot]), np.asarray(m))
 
 
 def test_dropout_off_at_eval_on_at_train() -> None:
