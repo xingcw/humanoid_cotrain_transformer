@@ -191,12 +191,14 @@ def collate_windows(windows: list[dict]) -> dict[str, np.ndarray]:
     batch["source_mask"] = np.array(
         [bool(w["source_is_robot"]) for w in windows], dtype=bool,
     )
-    # The projection heads expect state_robot / state_human keys; map
-    # proprio -> state_robot and human_kin -> state_human here so the
-    # trainer can hand the dict straight to ProjectionHeads.__call__.
+    # The projection heads expect state_robot / state_human / box / contact
+    # keys; map the schema names (proprio, human_kin, box_state,
+    # contact_lift) here so the trainer can hand the dict straight to
+    # ProjectionHeads.__call__ with no extra renaming.
     batch["state_robot"] = batch.pop("proprio")
     batch["state_human"] = batch.pop("human_kin")
     batch["contact"] = batch.pop("contact_lift")
+    batch["box"] = batch.pop("box_state")
     batch["episode_ids"] = np.array([w["episode_id"] for w in windows], dtype=object)
     batch["window_starts"] = np.array([w["window_start"] for w in windows], dtype=np.int32)
     return batch

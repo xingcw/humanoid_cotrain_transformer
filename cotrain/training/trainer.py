@@ -82,10 +82,45 @@ def train_step(
     batch: dict[str, jnp.ndarray],
 ):
     """One optimizer update. Returns (loss, aux) — model + optimizer state
-    are mutated in place per NNX semantics."""
+    are mutated in place per NNX semantics. Use for synthetic-vis batches
+    (no DINO encoder); for real RGB batches use `train_step_with_encoder`."""
 
     def _loss_fn(model: CoTrainTransformer):
         preds = model(batch, deterministic=False)
+        loss, aux = compute_loss(preds, batch, weights=LossWeights())
+        return loss, aux
+
+    grad_fn = nnx.value_and_grad(_loss_fn, has_aux=True)
+    (loss, aux), grads = grad_fn(model)
+    optimizer.update(model, grads)
+    return loss, aux
+
+
+@nnx.jit
+def train_step_with_encoder(
+    model: CoTrainTransformer,
+    optimizer: nnx.Optimizer,
+    encoder: nnx.Module,                  # cotrain.models.encoders.DinoV2Encoder
+    batch: dict[str, jnp.ndarray],
+):
+    """Variant for batches that carry raw RGB (the loader's output).
+
+    The encoder is FROZEN — its Params are not registered with the
+    optimizer. We additionally wrap its output in `jax.lax.stop_gradient`
+    so XLA doesn't even materialize the encoder's gradient computation.
+    The two together (optimizer-wise + stop_gradient) give us the §3.2
+    "encoder is in the graph but not in the gradient tree" semantics.
+    """
+    vis = encoder.forward_image_batch(batch["rgb"])
+    vis = jax.lax.stop_gradient(vis)
+    # The transformer's projection heads accept only the slot-named keys
+    # plus source_mask. `rgb` is consumed here by the encoder; drop it
+    # before handing the batch to the model.
+    tbatch = {k: v for k, v in batch.items() if k != "rgb"}
+    tbatch["vis"] = vis
+
+    def _loss_fn(model: CoTrainTransformer):
+        preds = model(tbatch, deterministic=False)
         loss, aux = compute_loss(preds, batch, weights=LossWeights())
         return loss, aux
 

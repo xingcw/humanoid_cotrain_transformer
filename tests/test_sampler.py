@@ -42,7 +42,7 @@ def test_batch_size_and_split_match_spec(shard_root: Path) -> None:
     assert src.shape == (8,)
     assert src.sum() == 2
     assert batch["rgb"].shape == (8, T, 224, 224, 3)
-    assert batch["box_state"].shape == (8, T, 7)
+    assert batch["box"].shape == (8, T, 7)
     assert batch["phase"].shape == (8, T, 1)
     assert batch["contact"].shape == (8, T, 3)
     assert batch["state_robot"].shape == (8, T, 50)
@@ -76,7 +76,7 @@ def test_determinism_given_same_seed(shard_root: Path) -> None:
         b = next(loader_b)
         np.testing.assert_array_equal(a["source_mask"], b["source_mask"])
         np.testing.assert_array_equal(a["rgb"], b["rgb"])
-        np.testing.assert_array_equal(a["box_state"], b["box_state"])
+        np.testing.assert_array_equal(a["box"], b["box"])
         np.testing.assert_array_equal(a["episode_ids"], b["episode_ids"])
         np.testing.assert_array_equal(a["window_starts"], b["window_starts"])
 
@@ -129,7 +129,7 @@ def test_collate_keys_match_model_contract(shard_root: Path) -> None:
     loader = make_mixed_loader(shard_root, w=0.5, batch_size=2, seed=0)
     batch = next(loader)
     expected = {
-        "rgb", "box_state", "phase", "contact",
+        "rgb", "box", "phase", "contact",
         "state_robot", "state_human", "action", "source_mask",
     }
     assert expected.issubset(batch.keys()), expected - batch.keys()
