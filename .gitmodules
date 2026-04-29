@@ -1,0 +1,3 @@
+[submodule "human-humanoid-cotrain"]
+	path = human-humanoid-cotrain
+	url = https://github.com/Jirl-upenn/human-humanoid-cotrain.git

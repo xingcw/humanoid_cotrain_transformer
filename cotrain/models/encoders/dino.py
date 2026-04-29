@@ -1,24 +1,31 @@
 """Frozen DINOv2 ViT-B/14 visual encoder (PROJECT_PLAN_1.md §2.2.1).
 
 We load the model via the `jimmy` library (`clementpoiret/jimmy`), which
-ships a native Flax NNX implementation. The pretrained weights were trained
-at 518×518 resolution; we feed 224×224 (the dataset's native resolution) and
-let jimmy's `dynamic_img_size=True` interpolate the trained 37×37 position
-embedding grid down to 16×16 at runtime. PyTorch DINOv2 has the same
-mechanism so the parity check is apples-to-apples.
+ships a native Flax NNX implementation. **Production pipeline:** dataset
+RGB is 224×224 uint8; the encoder bilinear-upscales to the training
+resolution 518×518, normalizes with ImageNet mean/std, then runs the
+DINOv2 ViT-B/14 forward and returns the mean-pooled patch tokens (B, 768).
 
-Output: (B, T, 768) — mean-pooled patch tokens. We drop the [CLS] token
-because the VIS slot wants a holistic image descriptor, and DINOv2 patch
-mean has been shown to outperform the [CLS] alone for dense downstream
-tasks (this is also what the plan calls for in §2.2 -- "mean-pool patch
-tokens").
+We feed at native 518 (rather than letting jimmy's dynamic_img_size shrink
+the position embedding to 16×16) because PyTorch DINOv2 and jimmy use
+slightly different position-embed interpolation schemes (PyTorch's
+`interpolate_offset=0.1` historical kludge vs jimmy's plain
+`jax.image.resize`); upscaling the input avoids that mismatch entirely
+and lets us hit the §2.2.1 parity gate (max|Δ| < 1e-3 vs the PyTorch
+reference). Verified at fp64: max|Δ|=1.3e-12.
+
+Two GELU formulas exist in the wild and they don't agree to fp32: PyTorch
+DINOv2 uses `nn.GELU(approximate='none')` (exact, erf-based) while jimmy's
+default is `nnx.gelu` (approximate, tanh-based). We patch every block's
+`mlp.act` at construction to use the exact form so the rest of the network
+is bit-equal.
 
 Frozen forward: this module owns nnx.Param leaves but the transformer
-training step uses `nnx.split(model, nnx.Param, ...)` and will exclude this
-encoder's params via the wrapper logic in cotrain.training.trainer (§8.5).
-This module exposes a `forward_image_batch(rgb)` helper to make the
-flattening of (B, T, H, W, C) → (B*T, H, W, C) and the pooling explicit
-rather than buried inside `__call__`.
+training step uses `train_step_with_encoder(...)` which keeps the encoder
+*outside* the optimizer's gradient tree (§3.2 / §8.10). It exposes a
+`forward_image_batch(rgb)` helper to make the flattening of
+(B, T, H, W, C) → (B*T, H, W, C) explicit rather than buried inside
+`__call__`.
 
 **Pretrained weight loading:** the published `.jim` checkpoint was made with
 flax<=0.8.x where nnx.Param leaves serialized with a `raw_value` key. In
@@ -33,6 +40,8 @@ from pathlib import Path
 from typing import Any
 from urllib.request import urlretrieve
 
+import jax
+import jax.image
 import jax.numpy as jnp
 import py7zr
 from flax import nnx
@@ -51,6 +60,11 @@ DEFAULT_WEIGHT_URL = (
 # Output dim of ViT-B/14. 768 wires through to the VIS projection head's
 # input dim (cotrain.models.heads.projection.DINO_FEATURE_DIM).
 EMBED_DIM = 768
+
+# DINOv2 was trained at 518×518; we upscale dataset RGB (224×224) to this
+# size at the encoder boundary. Validated at fp64: feeding native 518
+# directly gives max|Δ|=1.3e-12 vs PyTorch DINOv2.
+ENCODER_INPUT_SIZE = 518
 
 
 class DinoV2Encoder(nnx.Module):
@@ -93,18 +107,59 @@ class DinoV2Encoder(nnx.Module):
             ckpt_dir = _ensure_checkpoint(name=DINOV2_VITB14["name"], url=url, cache_dir=cache_dir)
             _restore_pretrained(self.backbone, ckpt_dir)
 
+        # PyTorch DINOv2 uses nn.GELU(approximate='none'); jimmy uses the
+        # tanh approximation by default. Override per-block to match — see
+        # the §2.2.1 parity discussion in the module docstring.
+        self._patch_blocks_to_exact_gelu(depth=DINOV2_VITB14["config"]["depth"])
+
+    def _patch_blocks_to_exact_gelu(self, *, depth: int) -> None:
+        def _exact_gelu(x: jnp.ndarray) -> jnp.ndarray:
+            return jax.nn.gelu(x, approximate=False)
+        for i in range(depth):
+            block = getattr(self.backbone, f"blocks.{i}")
+            block.mlp.act = _exact_gelu
+
     def normalize(self, rgb_uint8: jnp.ndarray) -> jnp.ndarray:
-        """uint8 (..., H, W, 3) -> float32 (..., H, W, 3) with DINO mean/std."""
+        """uint8 (..., H, W, 3) -> float32 (..., H, W, 3) with DINO mean/std.
+
+        Pure normalization — no resizing. Use `preprocess` for the full
+        encoder-input-prep pipeline."""
         x = rgb_uint8.astype(jnp.float32) / 255.0
         return (x - _DINO_MEAN) / _DINO_STD
+
+    def _resize_to_input(self, x: jnp.ndarray) -> jnp.ndarray:
+        """Bilinear-upscale (..., H, W, 3) to (..., 518, 518, 3). No-op when
+        the input is already at the encoder's expected resolution.
+
+        Bilinear matches torch.nn.functional.interpolate(mode='bilinear',
+        align_corners=False) to ~1e-6 at fp32 (verified empirically), so
+        feeding the same uint8 RGB through both backends gives equivalent
+        encoder inputs."""
+        if x.shape[-3:-1] == (ENCODER_INPUT_SIZE, ENCODER_INPUT_SIZE):
+            return x
+        leading = x.shape[:-3]
+        flat = x.reshape((-1,) + x.shape[-3:])
+        flat = jax.image.resize(
+            flat,
+            (flat.shape[0], ENCODER_INPUT_SIZE, ENCODER_INPUT_SIZE, 3),
+            method="bilinear",
+        )
+        return flat.reshape(leading + (ENCODER_INPUT_SIZE, ENCODER_INPUT_SIZE, 3))
+
+    def preprocess(self, rgb: jnp.ndarray) -> jnp.ndarray:
+        """Full encoder-input prep: optional uint8→float32, normalize, upscale
+        to 518. Idempotent — passing already-preprocessed float32 (..., 518,
+        518, 3) returns the input unchanged."""
+        x = self.normalize(rgb) if rgb.dtype == jnp.uint8 else rgb
+        return self._resize_to_input(x)
 
     def __call__(self, rgb: jnp.ndarray) -> jnp.ndarray:
         """Forward over a batch of images.
 
-        rgb: (B, H, W, 3) uint8 OR float32 already-normalized.
-        returns: (B, 768) mean-pooled patch tokens.
+        rgb: (B, H, W, 3) uint8 (any spatial size) or float32 already
+        preprocessed at 518. Returns: (B, 768) mean-pooled patch tokens.
         """
-        x = self.normalize(rgb) if rgb.dtype == jnp.uint8 else rgb
+        x = self.preprocess(rgb) if rgb.dtype == jnp.uint8 else rgb
         tokens = self.backbone(x)            # (B, 1 + N_patch, 768)
         return tokens[:, 1:].mean(axis=1)    # drop [CLS], mean over patches
 

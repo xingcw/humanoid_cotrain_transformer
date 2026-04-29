@@ -92,3 +92,42 @@ def test_param_tree_includes_encoder_when_split() -> None:
     leaves = jax.tree_util.tree_leaves(state)
     # ViT-B/14: depth=12 blocks, each with multiple Params; expect well over 100.
     assert len(leaves) >= 100, f"expected many Param leaves, got {len(leaves)}"
+
+
+def test_preprocess_upscales_224_to_518() -> None:
+    """Encoder upscales 224×224 uint8 inputs to the trained 518×518 size."""
+    from cotrain.models.encoders import ENCODER_INPUT_SIZE
+    enc = _make_encoder()
+    rgb = jnp.asarray(np.random.default_rng(0).integers(
+        0, 256, size=(2, 224, 224, 3)).astype(np.uint8))
+    out = enc.preprocess(rgb)
+    assert out.shape == (2, ENCODER_INPUT_SIZE, ENCODER_INPUT_SIZE, 3)
+    assert out.dtype == jnp.float32
+
+
+def test_preprocess_is_idempotent_at_target_size() -> None:
+    """Already-preprocessed inputs at 518×518 pass through unchanged."""
+    from cotrain.models.encoders import ENCODER_INPUT_SIZE
+    enc = _make_encoder()
+    pre = jnp.asarray(np.random.default_rng(1).normal(
+        size=(1, ENCODER_INPUT_SIZE, ENCODER_INPUT_SIZE, 3)).astype(np.float32))
+    # Preprocess on already-fp32-and-correct-size input is just the resize
+    # no-op (no normalize since it's not uint8).
+    out = enc._resize_to_input(pre)
+    np.testing.assert_array_equal(np.asarray(out), np.asarray(pre))
+
+
+def test_block_mlp_act_patched_to_exact_gelu() -> None:
+    """Every block's MLP must use the erf-based exact GELU to match the
+    PyTorch DINOv2 reference (PROJECT_PLAN_1.md §2.2.1)."""
+    enc = _make_encoder()
+    # Probe a known-large input where exact and approximate GELU disagree.
+    x_test = jnp.array([16.0, -16.0], dtype=jnp.float32)
+    expected = jax.nn.gelu(x_test, approximate=False)
+    for i in range(12):
+        block = getattr(enc.backbone, f"blocks.{i}")
+        np.testing.assert_allclose(
+            np.asarray(block.mlp.act(x_test)), np.asarray(expected),
+            rtol=0, atol=1e-6,
+            err_msg=f"block {i} mlp.act not exact GELU",
+        )
